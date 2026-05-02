@@ -1,0 +1,36 @@
+name: Daily Email Report
+
+on:
+  schedule:
+    # 9:00 Europe/Madrid. Madrid is UTC+1 in winter (CET) and UTC+2 in summer (CEST).
+    # GitHub Actions cron is UTC-only, so we run twice and the script no-ops if it's
+    # not 9am local. Simpler: cron at 07:00 UTC (= 9am CEST summer / 8am CET winter).
+    # Pick one. For most of the year you'll be on CEST, so 07:00 UTC = 9am local.
+    # If you want exactly 9am year-round, use both lines and accept the 1h drift,
+    # or switch to a tz-aware scheduler. Keeping it simple here:
+    - cron: "0 7 * * *"
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run reporter
+        env:
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPORT_TIMEZONE: Europe/Madrid
+        run: python main.py
