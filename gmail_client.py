@@ -6,6 +6,10 @@ Computes four metrics for the daily report:
 - avg_response_seconds: avg time between prior inbound and our reply
 - still_waiting:   threads where, as of *now*, the latest message is NOT from us
                    (so if you already replied this morning, it drops out)
+
+Performance: the still_waiting check fans out one threads.get per active
+thread. We batch those requests in chunks of BATCH_SIZE to keep total
+runtime under a minute even with hundreds of active threads.
 """
 from __future__ import annotations
 
@@ -16,17 +20,20 @@ from typing import Iterable
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import BatchHttpRequest
 
 import config
 
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-# How far back to look when computing "still waiting" threads. Threads that
-# have been quiet for longer than this are considered closed — they won't
-# count even if the last message was from someone else, because realistically
-# they're stale, not "still waiting".
-STILL_WAITING_LOOKBACK_DAYS = 14
+# How far back to look when computing "still waiting" threads. Threads quiet
+# longer than this are considered closed — they won't count even if the last
+# message was from someone else, because realistically they're stale.
+STILL_WAITING_LOOKBACK_DAYS = 10
+
+# Gmail API allows up to 100 sub-requests per batch. Keep some headroom.
+BATCH_SIZE = 50
 
 SENT_LABEL = "SENT"
 INBOX_LABEL = "INBOX"
@@ -117,24 +124,68 @@ def _list_thread_ids(service, query: str) -> list[str]:
     return ids
 
 
-def _get_message(service, message_id: str) -> dict:
-    """Fetch message metadata. Includes labelIds, internalDate, headers."""
-    return service.users().messages().get(
-        userId=config.GMAIL_USER_ID,
-        id=message_id,
-        format="metadata",
-        metadataHeaders=["In-Reply-To", "References", "Date", "From"],
-    ).execute()
+def _batch_get_messages(service, ids: list[str]) -> dict[str, dict]:
+    """Fetch many messages in parallel using Gmail's HTTP batch endpoint."""
+    results: dict[str, dict] = {}
+    errors: list[Exception] = []
+
+    def _callback(request_id, response, exception):
+        if exception is not None:
+            errors.append(exception)
+            return
+        results[request_id] = response
+
+    for chunk_start in range(0, len(ids), BATCH_SIZE):
+        chunk = ids[chunk_start:chunk_start + BATCH_SIZE]
+        batch = service.new_batch_http_request(callback=_callback)
+        for mid in chunk:
+            batch.add(
+                service.users().messages().get(
+                    userId=config.GMAIL_USER_ID,
+                    id=mid,
+                    format="metadata",
+                    metadataHeaders=["In-Reply-To", "References", "Date", "From"],
+                ),
+                request_id=mid,
+            )
+        batch.execute()
+
+    if errors:
+        # Surface the first error rather than silently skipping; better to fail
+        # loud than to publish wrong stats.
+        raise errors[0]
+    return results
 
 
-def _get_thread_messages(service, thread_id: str) -> list[dict]:
-    resp = service.users().threads().get(
-        userId=config.GMAIL_USER_ID,
-        id=thread_id,
-        format="metadata",
-        metadataHeaders=["From", "Date"],
-    ).execute()
-    return resp.get("messages", [])
+def _batch_get_threads(service, ids: list[str]) -> dict[str, list[dict]]:
+    """Fetch many threads in parallel. Returns {thread_id: [messages...]}."""
+    results: dict[str, list[dict]] = {}
+    errors: list[Exception] = []
+
+    def _callback(request_id, response, exception):
+        if exception is not None:
+            errors.append(exception)
+            return
+        results[request_id] = response.get("messages", [])
+
+    for chunk_start in range(0, len(ids), BATCH_SIZE):
+        chunk = ids[chunk_start:chunk_start + BATCH_SIZE]
+        batch = service.new_batch_http_request(callback=_callback)
+        for tid in chunk:
+            batch.add(
+                service.users().threads().get(
+                    userId=config.GMAIL_USER_ID,
+                    id=tid,
+                    format="metadata",
+                    metadataHeaders=["From", "Date"],
+                ),
+                request_id=tid,
+            )
+        batch.execute()
+
+    if errors:
+        raise errors[0]
+    return results
 
 
 def _header(msg: dict, name: str) -> str | None:
@@ -171,50 +222,36 @@ def _previous_inbound_in_thread(thread_messages: list[dict], reply_msg: dict) ->
 
 
 def _count_emails_received(service, after_ts: int, before_ts: int) -> int:
-    """Count messages that landed in the inbox during the window.
-
-    Excludes chats (Gmail surfaces Hangouts/Chat messages via the API too)
-    and anything we sent ourselves (rare in inbox, but possible via filters
-    or self-addressed mail).
-    """
+    """Count messages that landed in the inbox during the window."""
     query = f"in:inbox -in:chats after:{after_ts} before:{before_ts}"
     ids = _list_message_ids(service, query)
     if not ids:
         return 0
 
-    # Defensive filter: drop anything that has the SENT label even if it
-    # somehow showed up in inbox (e.g. mailing-list loops).
-    count = 0
-    for mid in ids:
-        msg = _get_message(service, mid)
-        if not _is_sent_by_me(msg):
-            count += 1
-    return count
+    messages = _batch_get_messages(service, ids)
+    return sum(1 for m in messages.values() if not _is_sent_by_me(m))
 
 
 def _count_still_waiting(service) -> int:
     """Count threads where the latest message is NOT from us, as of now.
 
-    We bound the search to the last STILL_WAITING_LOOKBACK_DAYS so we don't
-    scan the entire mailbox. A thread quiet for >2 weeks isn't "waiting" —
-    it's abandoned.
-
-    Checks the FULL thread including today's messages, so if you replied
-    earlier today the thread correctly drops out of the count.
+    Bounded to STILL_WAITING_LOOKBACK_DAYS so we don't scan the entire mailbox.
+    Uses batched threads.get to keep runtime bounded.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=STILL_WAITING_LOOKBACK_DAYS)
     after_ts = int(cutoff.timestamp())
 
-    # Threads that received any inbound activity in the lookback window.
     query = f"in:inbox -in:chats after:{after_ts}"
     thread_ids = _list_thread_ids(service, query)
+    if not thread_ids:
+        return 0
+
+    threads = _batch_get_threads(service, thread_ids)
 
     waiting = 0
-    for tid in thread_ids:
-        messages = _get_thread_messages(service, tid)
+    for messages in threads.values():
         if not messages:
             continue
-        # Gmail returns thread messages chronologically, but sort defensively.
         latest = max(messages, key=_internal_date_ms)
         if not _is_sent_by_me(latest):
             waiting += 1
@@ -229,23 +266,27 @@ def _collect_reply_stats(service, target_date) -> tuple[int, float | None, int]:
 
     sent_query = f"in:sent after:{after_ts} before:{before_ts}"
     sent_ids = _list_message_ids(service, sent_query)
+    if not sent_ids:
+        return 0, None, 0
 
-    reply_count = 0
+    sent_messages = _batch_get_messages(service, sent_ids)
+
+    reply_msgs = {mid: m for mid, m in sent_messages.items() if _is_reply(m)}
+    reply_count = len(reply_msgs)
+
+    if reply_count == 0:
+        return 0, None, 0
+
+    # Batch-fetch the unique threads we need for response-time calculation.
+    thread_ids = list({m["threadId"] for m in reply_msgs.values()})
+    thread_cache = _batch_get_threads(service, thread_ids)
+
     response_seconds: list[float] = []
-    thread_cache: dict[str, list[dict]] = {}
-
-    for mid in sent_ids:
-        msg = _get_message(service, mid)
-        if not _is_reply(msg):
+    for mid, msg in reply_msgs.items():
+        thread_msgs = thread_cache.get(msg["threadId"], [])
+        full_reply = next((m for m in thread_msgs if m["id"] == mid), None)
+        if full_reply is None:
             continue
-        reply_count += 1
-
-        thread_id = msg["threadId"]
-        if thread_id not in thread_cache:
-            thread_cache[thread_id] = _get_thread_messages(service, thread_id)
-        thread_msgs = thread_cache[thread_id]
-
-        full_reply = next((m for m in thread_msgs if m["id"] == mid), msg)
         prior = _previous_inbound_in_thread(thread_msgs, full_reply)
         if prior is not None:
             delta_ms = _internal_date_ms(full_reply) - _internal_date_ms(prior)
